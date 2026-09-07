@@ -4,8 +4,9 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Bitácora</title>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap');
   * { box-sizing: border-box; }
@@ -221,6 +222,56 @@ const URGENCY = {
 const urgencyRank = u => URGENCY[u] ? URGENCY[u].rank : 3;
 const uid = p => p + "_" + Math.random().toString(36).slice(2, 9);
 const STORAGE_KEY = "bitacora-standalone-v1";
+
+// ---------- Google Calendar (OAuth directo, sin backend) ----------
+const GCAL_CLIENT_ID = "431629068496-eius4r3k5h4il1g1ehclm7jmmg70g6jh.apps.googleusercontent.com";
+const GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+function buildRRule(rec) {
+  if (!rec || rec.type === "none") return null;
+  const interval = Math.max(1, rec.interval || 1);
+  const freq = rec.type === "daily" ? "DAILY" : rec.type === "weekly" ? "WEEKLY" : "MONTHLY";
+  return `RRULE:FREQ=${freq};INTERVAL=${interval}`;
+}
+async function gcalInsertEvent(token, task) {
+  const body = {
+    summary: task.title,
+    description: task.notes || undefined,
+    start: {
+      date: task.startDate
+    },
+    end: {
+      date: addDaysISO(task.startDate, 1)
+    }
+  };
+  const rrule = buildRRule(task.recurrence);
+  if (rrule) body.recurrence = [rrule];
+  const res = await fetch("https://www.googleapis.com/calendar/v3/calendars/primary/events", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error && err.error.message || `HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  return data.id;
+}
+async function gcalDeleteEvent(token, eventId) {
+  const res = await fetch(`https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+  if (!res.ok && res.status !== 410 && res.status !== 404) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error && err.error.message || `HTTP ${res.status}`);
+  }
+}
 function Plandia() {
   const [loaded, setLoaded] = useState(false);
   const [categories, setCategories] = useState([]);
@@ -235,7 +286,45 @@ function Plandia() {
   const [editingCategory, setEditingCategory] = useState(null);
   const [expanded, setExpanded] = useState({});
   const [kpiScope, setKpiScope] = useState("todo");
+  const [gcalToken, setGcalToken] = useState(null);
+  const [gcalConnecting, setGcalConnecting] = useState(false);
+  const [gcalError, setGcalError] = useState("");
+  const gcalTokenClient = useRef(null);
   const saveTimer = useRef(null);
+  useEffect(() => {
+    let cancelled = false;
+    function init() {
+      if (cancelled) return;
+      if (window.google && window.google.accounts && window.google.accounts.oauth2) {
+        gcalTokenClient.current = window.google.accounts.oauth2.initTokenClient({
+          client_id: GCAL_CLIENT_ID,
+          scope: GCAL_SCOPE,
+          callback: resp => {
+            setGcalConnecting(false);
+            if (resp && resp.access_token) {
+              setGcalToken(resp.access_token);
+              setGcalError("");
+            } else setGcalError("No se pudo conectar. Probá de nuevo.");
+          }
+        });
+      } else {
+        setTimeout(init, 300);
+      }
+    }
+    init();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const connectGcal = () => {
+    if (!gcalTokenClient.current) {
+      setGcalError("Todavía está cargando Google, esperá un segundo y probá de nuevo.");
+      return;
+    }
+    setGcalConnecting(true);
+    setGcalError("");
+    gcalTokenClient.current.requestAccessToken();
+  };
   useEffect(() => {
     (async () => {
       try {
@@ -422,13 +511,43 @@ function Plandia() {
     if (activeCategory === id) setActiveCategory(null);
     setConfirmingCatDelete(null);
   };
-  const addTask = data => {
+  const addTask = async (data, syncCalendar) => {
     const id = uid("t");
-    setTasks(ts => [...ts, {
+    const task = {
       id,
       createdAt: Date.now(),
+      gcal: {
+        status: "idle",
+        eventId: null
+      },
       ...data
-    }]);
+    };
+    setTasks(ts => [...ts, task]);
+    if (syncCalendar && gcalToken) {
+      patchTask(id, {
+        gcal: {
+          status: "syncing",
+          eventId: null
+        }
+      });
+      try {
+        const eventId = await gcalInsertEvent(gcalToken, task);
+        patchTask(id, {
+          gcal: {
+            status: "synced",
+            eventId
+          }
+        });
+      } catch (e) {
+        console.error(e);
+        patchTask(id, {
+          gcal: {
+            status: "error",
+            eventId: null
+          }
+        });
+      }
+    }
   };
   const deleteTask = task => {
     setTasks(ts => ts.filter(t => t.id !== task.id));
@@ -442,6 +561,38 @@ function Plandia() {
       return next;
     });
     setConfirmingDelete(null);
+    if (task.gcal && task.gcal.eventId && gcalToken) {
+      gcalDeleteEvent(gcalToken, task.gcal.eventId).catch(e => console.error("No se pudo borrar el evento", e));
+    }
+  };
+  const retrySync = async task => {
+    if (!gcalToken) {
+      setGcalError("Conectá Google Calendar primero (botón arriba a la derecha).");
+      return;
+    }
+    patchTask(task.id, {
+      gcal: {
+        status: "syncing",
+        eventId: null
+      }
+    });
+    try {
+      const eventId = await gcalInsertEvent(gcalToken, task);
+      patchTask(task.id, {
+        gcal: {
+          status: "synced",
+          eventId
+        }
+      });
+    } catch (e) {
+      console.error(e);
+      patchTask(task.id, {
+        gcal: {
+          status: "error",
+          eventId: null
+        }
+      });
+    }
   };
   const setStatus = (key, newStatus) => setOverrides(ov => {
     const current = ov[key] || "pending";
@@ -598,16 +749,35 @@ function Plandia() {
     style: styles.title
   }, view === "hoy" ? "Hoy" : view === "proximos" ? "Próximos" : view === "categoria" ? "Por categoría" : view === "kpi" ? "Panel KPI" : "Todo"), /*#__PURE__*/React.createElement("p", {
     style: styles.subtitle
-  }, fmtLong(today))), view !== "kpi" && /*#__PURE__*/React.createElement("button", {
+  }, fmtLong(today))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 10
+    }
+  }, gcalToken ? /*#__PURE__*/React.createElement("span", {
+    style: styles.gcalConnected
+  }, /*#__PURE__*/React.createElement(Ic, {
+    size: 13
+  }, "✓"), " Calendar conectado") : /*#__PURE__*/React.createElement("button", {
+    style: styles.gcalConnectBtn,
+    onClick: connectGcal,
+    disabled: gcalConnecting
+  }, /*#__PURE__*/React.createElement(Ic, {
+    size: 13
+  }, gcalConnecting ? "⟳" : "🗓"), " ", gcalConnecting ? "Conectando…" : "Conectar Google Calendar"), view !== "kpi" && /*#__PURE__*/React.createElement("button", {
     style: styles.newBtn,
     onClick: () => setShowForm(v => !v)
   }, /*#__PURE__*/React.createElement(Ic, {
     size: 15
-  }, "+"), " Nueva tarea")), showForm && view !== "kpi" && /*#__PURE__*/React.createElement(NewTaskForm, {
+  }, "+"), " Nueva tarea"))), gcalError && /*#__PURE__*/React.createElement("div", {
+    style: styles.gcalErrorBanner
+  }, gcalError), showForm && view !== "kpi" && /*#__PURE__*/React.createElement(NewTaskForm, {
     categories: categories,
+    gcalConnected: !!gcalToken,
     onCancel: () => setShowForm(false),
-    onSave: data => {
-      addTask(data);
+    onSave: (data, sync) => {
+      addTask(data, sync);
       setShowForm(false);
     }
   }), /*#__PURE__*/React.createElement("div", {
@@ -654,6 +824,7 @@ function Plandia() {
     toggleSubtask: toggleSubtask,
     toggleCTA: toggleCTA,
     deleteTask: deleteTask,
+    retrySync: retrySync,
     confirmingDelete: confirmingDelete,
     setConfirmingDelete: setConfirmingDelete,
     showDate: false,
@@ -687,6 +858,7 @@ function Plandia() {
     toggleSubtask: toggleSubtask,
     toggleCTA: toggleCTA,
     deleteTask: deleteTask,
+    retrySync: retrySync,
     confirmingDelete: confirmingDelete,
     setConfirmingDelete: setConfirmingDelete,
     showDate: true,
@@ -702,6 +874,7 @@ function TaskRow({
   toggleSubtask,
   toggleCTA,
   deleteTask,
+  retrySync,
   confirmingDelete,
   setConfirmingDelete,
   showDate,
@@ -802,7 +975,10 @@ function TaskRow({
     size: 11
   }, promisedLate ? "⚠" : "🕐"), " prometida ", fmtShort(it.task.promisedDate)), cancelled && /*#__PURE__*/React.createElement("span", {
     style: styles.cancelledTag
-  }, "cancelada"))), /*#__PURE__*/React.createElement("button", {
+  }, "cancelada"), /*#__PURE__*/React.createElement(GcalBadge, {
+    task: it.task,
+    onRetry: () => retrySync(it.task)
+  }))), /*#__PURE__*/React.createElement("button", {
     onClick: () => setStatus(it.key, "cancelled"),
     title: cancelled ? "Reabrir esta instancia" : "Cancelar solo esta instancia",
     style: {
@@ -1034,6 +1210,54 @@ function KpiStat({
     }
   }, label));
 }
+function GcalBadge({
+  task,
+  onRetry
+}) {
+  const g = task.gcal || {
+    status: "idle"
+  };
+  if (g.status === "idle") return null;
+  if (g.status === "syncing") return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 3,
+      color: "#8A8A93",
+      fontWeight: 500
+    }
+  }, /*#__PURE__*/React.createElement(Ic, {
+    size: 11,
+    spin: true
+  }, "⟳"), " sincronizando");
+  if (g.status === "synced") return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 3,
+      color: "#5A7A55",
+      fontWeight: 500
+    }
+  }, /*#__PURE__*/React.createElement(Ic, {
+    size: 11
+  }, "✓"), " en calendar");
+  return /*#__PURE__*/React.createElement("span", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 3,
+      color: "#C1442D",
+      fontWeight: 500,
+      cursor: "pointer"
+    },
+    onClick: e => {
+      e.stopPropagation();
+      onRetry();
+    }
+  }, /*#__PURE__*/React.createElement(Ic, {
+    size: 11
+  }, "⚠"), " reintentar sync");
+}
 function NewCategoryForm({
   onSave,
   onCancel,
@@ -1086,6 +1310,7 @@ function NewCategoryForm({
 }
 function NewTaskForm({
   categories,
+  gcalConnected,
   onCancel,
   onSave
 }) {
@@ -1101,6 +1326,7 @@ function NewTaskForm({
   const [ctaLabel, setCtaLabel] = useState("Contactar cliente");
   const [urgency, setUrgency] = useState("media");
   const [promisedDate, setPromisedDate] = useState("");
+  const [syncCalendar, setSyncCalendar] = useState(false);
   useEffect(() => {
     if (!categoryId && categories.length) setCategoryId(categories[0].id);
   }, [categories]); // eslint-disable-line
@@ -1150,7 +1376,7 @@ function NewTaskForm({
       } : null,
       urgency,
       promisedDate: promisedDate || null
-    });
+    }, syncCalendar);
   };
   return /*#__PURE__*/React.createElement("div", {
     style: styles.formPanel
@@ -1314,7 +1540,18 @@ function NewTaskForm({
       marginBottom: 10,
       width: "100%"
     }
-  }), error && /*#__PURE__*/React.createElement("div", {
+  }), gcalConnected ? /*#__PURE__*/React.createElement("label", {
+    style: styles.checkboxRow
+  }, /*#__PURE__*/React.createElement("input", {
+    type: "checkbox",
+    checked: syncCalendar,
+    onChange: e => setSyncCalendar(e.target.checked)
+  }), " Sincronizar con Google Calendar") : /*#__PURE__*/React.createElement("div", {
+    style: {
+      ...styles.noCategoryHint,
+      marginBottom: 8
+    }
+  }, "Conectá Google Calendar (botón arriba a la derecha) para poder sincronizar esta tarea."), error && /*#__PURE__*/React.createElement("div", {
     style: styles.formError
   }, error), /*#__PURE__*/React.createElement("div", {
     style: {
@@ -1863,6 +2100,40 @@ const styles = {
     fontSize: 12,
     color: "#4C475A",
     flexWrap: "wrap"
+  },
+  gcalConnectBtn: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: "#fff",
+    color: "#33566B",
+    border: `1px solid ${LINE}`,
+    borderRadius: 8,
+    padding: "8px 12px",
+    fontSize: 12.5,
+    fontWeight: 500,
+    cursor: "pointer"
+  },
+  gcalConnected: {
+    display: "flex",
+    alignItems: "center",
+    gap: 6,
+    background: "#EAF1E8",
+    color: "#5A7A55",
+    border: "1px solid #CFE0CB",
+    borderRadius: 8,
+    padding: "7px 12px",
+    fontSize: 12.5,
+    fontWeight: 500
+  },
+  gcalErrorBanner: {
+    margin: "0 24px 12px",
+    background: "#FBEFEC",
+    border: "1px solid #E0B3A6",
+    color: "#B0503A",
+    borderRadius: 8,
+    padding: "8px 12px",
+    fontSize: 12.5
   }
 };
 ReactDOM.createRoot(document.getElementById("root")).render(/*#__PURE__*/React.createElement(Plandia, null));
