@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bitácora</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600&family=IBM+Plex+Sans:wght@400;500&display=swap');
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #DCD9D2; font-family: 'IBM Plex Sans', sans-serif; }
+  #root { max-width: 1100px; margin: 24px auto; padding: 0 16px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .pld-row:hover { background: #F7F6F4; }
+  .pld-scroll::-webkit-scrollbar { width: 8px; }
+  .pld-scroll::-webkit-scrollbar-thumb { background: #E3E1E6; border-radius: 8px; }
+  .pld-cat-btn:hover { background: #F7F6F4; }
+  input, select, textarea, button { font-family: 'IBM Plex Sans', sans-serif; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+// ---------- shim de storage: localStorage en vez de window.storage de Claude ----------
+window.storage = {
+  get: async (key) => {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error("not found");
+    return { key, value: v, shared: false };
+  },
+  set: async (key, value) => { localStorage.setItem(key, value); return { key, value, shared: false }; },
+  delete: async (key) => { localStorage.removeItem(key); return { key, deleted: true, shared: false }; },
+};
+
+// ---------- iconos simples (sin dependencias externas) ----------
+const Ic = ({ children, size = 14, spin, style, title }) => (
+  <span title={title} style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: size, lineHeight: 1, flexShrink: 0, ...(spin ? { animation: "spin 0.9s linear infinite" } : {}), ...style }}>{children}</span>
+);
+
+// ---------- date helpers ----------
+const pad = (n) => String(n).padStart(2, "0");
+const toISO = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+const parseISO = (s) => { const [y, m, d] = s.split("-").map(Number); return new Date(y, m - 1, d); };
+const todayISO = () => toISO(new Date());
+const addDaysISO = (iso, n) => { const d = parseISO(iso); d.setDate(d.getDate() + n); return toISO(d); };
+const addMonthsISO = (iso, n, day) => { const d = parseISO(iso); return toISO(new Date(d.getFullYear(), d.getMonth() + n, day)); };
+const diffDays = (aISO, bISO) => Math.round((parseISO(bISO) - parseISO(aISO)) / 86400000);
+const firstDayOfMonthISO = (iso) => { const d = parseISO(iso); return toISO(new Date(d.getFullYear(), d.getMonth(), 1)); };
+const lastDayOfMonthISO = (iso) => { const d = parseISO(iso); return toISO(new Date(d.getFullYear(), d.getMonth() + 1, 0)); };
+const fmtShort = (iso) => new Intl.DateTimeFormat("es-AR", { day: "numeric", month: "short" }).format(parseISO(iso));
+const fmtWeekday = (iso) => { const s = new Intl.DateTimeFormat("es-AR", { weekday: "long" }).format(parseISO(iso)); return s.charAt(0).toUpperCase() + s.slice(1); };
+const fmtLong = (iso) => new Intl.DateTimeFormat("es-AR", { day: "numeric", month: "long", year: "numeric" }).format(parseISO(iso));
+const fmtDateTime = (ts) => new Intl.DateTimeFormat("es-AR", { day: "numeric", month: "short", year: "numeric" }).format(new Date(ts));
+
+function dateLabel(iso, today) {
+  const diff = diffDays(today, iso);
+  if (diff === 0) return "Hoy";
+  if (diff === 1) return "Mañana";
+  if (diff < 0) return `Vencida · ${fmtShort(iso)}`;
+  if (diff > 1 && diff < 7) return fmtWeekday(iso);
+  return fmtShort(iso);
+}
+
+function occurrences(task, rangeStart, rangeEnd) {
+  const rec = task.recurrence || { type: "none" };
+  const out = [];
+  if (rec.type === "none") {
+    if (task.startDate >= rangeStart && task.startDate <= rangeEnd) out.push(task.startDate);
+    return out;
+  }
+  const interval = Math.max(1, rec.interval || 1);
+  if (rec.type === "daily") {
+    const step = interval;
+    let offset = diffDays(task.startDate, rangeStart);
+    let startOffset = offset > 0 ? Math.ceil(offset / step) * step : 0;
+    let d = addDaysISO(task.startDate, startOffset);
+    while (d <= rangeEnd) { if (d >= rangeStart) out.push(d); d = addDaysISO(d, step); }
+  } else if (rec.type === "weekly") {
+    const step = 7 * interval;
+    let offset = diffDays(task.startDate, rangeStart);
+    let startOffset = offset > 0 ? Math.ceil(offset / step) * step : 0;
+    let d = addDaysISO(task.startDate, startOffset);
+    while (d <= rangeEnd) { if (d >= rangeStart) out.push(d); d = addDaysISO(d, step); }
+  } else if (rec.type === "monthly") {
+    const [, , dayStr] = task.startDate.split("-");
+    const day = Number(dayStr);
+    let n = 0; let d = task.startDate;
+    while (d < rangeStart) { n += interval; d = addMonthsISO(task.startDate, n, day); }
+    while (d <= rangeEnd) { out.push(d); n += interval; d = addMonthsISO(task.startDate, n, day); }
+  }
+  return out;
+}
+
+const RECURRENCE_LABEL = (rec) => {
+  if (!rec || rec.type === "none") return null;
+  const n = rec.interval || 1;
+  if (rec.type === "daily") return n === 1 ? "Cada día" : `Cada ${n} días`;
+  if (rec.type === "weekly") return n === 1 ? "Cada semana" : `Cada ${n} semanas`;
+  if (rec.type === "monthly") return n === 1 ? "Cada mes" : `Cada ${n} meses`;
+  return null;
+};
+
+const CATEGORY_COLORS = [
+  { name: "malva", hex: "#8B4F82" },
+  { name: "tinta", hex: "#2C1B45" },
+  { name: "gris", hex: "#8A8A93" },
+  { name: "malva claro", hex: "#B27CA8" },
+];
+
+const URGENCY = {
+  alta: { label: "Alta", rank: 0, color: "#C1442D" },
+  media: { label: "Media", rank: 1, color: "#C98A2A" },
+  baja: { label: "Baja", rank: 2, color: "#8A8A93" },
+};
+const urgencyRank = (u) => (URGENCY[u] ? URGENCY[u].rank : 3);
+
+const uid = (p) => p + "_" + Math.random().toString(36).slice(2, 9);
+const STORAGE_KEY = "bitacora-standalone-v1";
+
+function Plandia() {
+  const [loaded, setLoaded] = useState(false);
+  const [categories, setCategories] = useState([]);
+  const [tasks, setTasks] = useState([]);
+  const [overrides, setOverrides] = useState({});
+
+  const [view, setView] = useState("hoy");
+  const [activeCategory, setActiveCategory] = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [confirmingDelete, setConfirmingDelete] = useState(null);
+  const [confirmingCatDelete, setConfirmingCatDelete] = useState(null);
+  const [showCatForm, setShowCatForm] = useState(false);
+  const [editingCategory, setEditingCategory] = useState(null);
+  const [expanded, setExpanded] = useState({});
+  const [kpiScope, setKpiScope] = useState("todo");
+  const saveTimer = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY);
+        if (res && res.value) {
+          const data = JSON.parse(res.value);
+          setCategories(data.categories || []);
+          setTasks(data.tasks || []);
+          setOverrides(data.overrides || {});
+        }
+      } catch (e) { /* sin datos guardados */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try { await window.storage.set(STORAGE_KEY, JSON.stringify({ categories, tasks, overrides })); }
+      catch (e) { console.error("No se pudo guardar", e); }
+    }, 300);
+    return () => clearTimeout(saveTimer.current);
+  }, [categories, tasks, overrides, loaded]);
+
+  const catById = useMemo(() => { const m = {}; categories.forEach((c) => (m[c.id] = c)); return m; }, [categories]);
+  const taskCounts = useMemo(() => { const m = {}; tasks.forEach((t) => (m[t.categoryId] = (m[t.categoryId] || 0) + 1)); return m; }, [tasks]);
+
+  const today = todayISO();
+  const items = useMemo(() => {
+    const rangeStart = addDaysISO(today, -21);
+    const rangeEnd = addDaysISO(today, 45);
+    const all = [];
+    tasks.forEach((task) => {
+      if (activeCategory && task.categoryId !== activeCategory) return;
+      occurrences(task, rangeStart, rangeEnd).forEach((date) => {
+        const key = `${task.id}__${date}`;
+        const status = overrides[key] || "pending";
+        all.push({ key, task, date, status });
+      });
+    });
+    let filtered;
+    if (view === "hoy") filtered = all.filter((i) => i.date === today || (i.date < today && i.status === "pending"));
+    else if (view === "proximos") filtered = all.filter((i) => i.date > today && i.date <= addDaysISO(today, 30));
+    else filtered = all;
+    filtered.sort((a, b) => {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+      const ua = urgencyRank(a.task.urgency), ub = urgencyRank(b.task.urgency);
+      if (ua !== ub) return ua - ub;
+      const ca = catById[a.task.categoryId]?.name || "", cb = catById[b.task.categoryId]?.name || "";
+      if (ca !== cb) return ca < cb ? -1 : 1;
+      return a.task.title.localeCompare(b.task.title);
+    });
+    return filtered;
+  }, [tasks, overrides, view, activeCategory, today, catById]);
+
+  const groups = useMemo(() => {
+    const g = []; let lastDate = null;
+    items.forEach((it) => {
+      if (it.date !== lastDate) { g.push({ date: it.date, label: dateLabel(it.date, today), rows: [] }); lastDate = it.date; }
+      g[g.length - 1].rows.push(it);
+    });
+    return g;
+  }, [items, today]);
+
+  const categoryGroups = useMemo(() => {
+    const rangeStart = addDaysISO(today, -21), rangeEnd = addDaysISO(today, 60);
+    const byCat = {};
+    tasks.forEach((task) => {
+      if (activeCategory && task.categoryId !== activeCategory) return;
+      const occ = occurrences(task, rangeStart, rangeEnd);
+      let refDate = occ.find((d) => d >= today);
+      if (!refDate) refDate = occ.length ? occ[occ.length - 1] : task.startDate;
+      const key = `${task.id}__${refDate}`;
+      const status = overrides[key] || "pending";
+      const catKey = task.categoryId || "__sin__";
+      if (!byCat[catKey]) byCat[catKey] = [];
+      byCat[catKey].push({ key, task, date: refDate, status });
+    });
+    const catList = categories.filter((c) => !activeCategory || c.id === activeCategory)
+      .map((c) => ({ category: c, rows: byCat[c.id] || [] })).filter((g) => g.rows.length > 0);
+    catList.forEach((g) => g.rows.sort((a, b) => {
+      const ua = urgencyRank(a.task.urgency), ub = urgencyRank(b.task.urgency);
+      if (ua !== ub) return ua - ub;
+      return a.task.title.localeCompare(b.task.title);
+    }));
+    return catList;
+  }, [tasks, overrides, categories, activeCategory, today]);
+
+  const kpiData = useMemo(() => {
+    const rangeStart = kpiScope === "mes" ? firstDayOfMonthISO(today) : addDaysISO(today, -3650);
+    const rangeEnd = kpiScope === "mes" ? lastDayOfMonthISO(today) : addDaysISO(today, 3650);
+    const byCat = {};
+    categories.forEach((c) => { byCat[c.id] = { category: c, done: 0, pending: 0, cancelled: 0, overdue: 0, total: 0 }; });
+    tasks.forEach((task) => {
+      const stat = byCat[task.categoryId];
+      if (!stat) return;
+      occurrences(task, rangeStart, rangeEnd).forEach((date) => {
+        const key = `${task.id}__${date}`;
+        const status = overrides[key] || "pending";
+        stat.total++;
+        if (status === "done") stat.done++;
+        else if (status === "cancelled") stat.cancelled++;
+        else { stat.pending++; if (date < today) stat.overdue++; }
+      });
+    });
+    return Object.values(byCat).filter((s) => s.total > 0);
+  }, [tasks, overrides, categories, kpiScope, today]);
+
+  const patchTask = (id, patch) => setTasks((ts) => ts.map((t) => (t.id === id ? { ...t, ...(typeof patch === "function" ? patch(t) : patch) } : t)));
+
+  const addCategory = (name, color) => { const id = uid("c"); setCategories((cs) => [...cs, { id, name, color }]); return id; };
+  const updateCategory = (id, name, color) => { setCategories((cs) => cs.map((c) => (c.id === id ? { ...c, name, color } : c))); setEditingCategory(null); };
+  const deleteCategory = (id) => {
+    setCategories((cs) => cs.filter((c) => c.id !== id));
+    const idsToRemove = new Set(tasks.filter((t) => t.categoryId === id).map((t) => t.id));
+    setTasks((ts) => ts.filter((t) => t.categoryId !== id));
+    setOverrides((ov) => { const next = { ...ov }; Object.keys(next).forEach((k) => { if (idsToRemove.has(k.split("__")[0])) delete next[k]; }); return next; });
+    if (activeCategory === id) setActiveCategory(null);
+    setConfirmingCatDelete(null);
+  };
+
+  const addTask = (data) => { const id = uid("t"); setTasks((ts) => [...ts, { id, createdAt: Date.now(), ...data }]); };
+  const deleteTask = (task) => {
+    setTasks((ts) => ts.filter((t) => t.id !== task.id));
+    setOverrides((ov) => { const next = { ...ov }; Object.keys(next).forEach((k) => { if (k.split("__")[0] === task.id) delete next[k]; }); return next; });
+    setConfirmingDelete(null);
+  };
+
+  const setStatus = (key, newStatus) => setOverrides((ov) => {
+    const current = ov[key] || "pending"; const next = { ...ov };
+    if (current === newStatus) delete next[key]; else next[key] = newStatus;
+    return next;
+  });
+  const toggleSubtask = (taskId, subId) => patchTask(taskId, (t) => ({ subtasks: t.subtasks.map((s) => (s.id === subId ? { ...s, done: !s.done } : s)) }));
+  const toggleCTA = (taskId) => patchTask(taskId, (t) => ({ cta: { ...t.cta, done: !t.cta.done } }));
+
+  if (!loaded) {
+    return <div style={styles.loadingWrap}><Ic size={20} spin>⟳</Ic><span style={{ marginLeft: 10, fontSize: 14, color: "#8A8A93" }}>Cargando bitácora…</span></div>;
+  }
+
+  return (
+    <div style={styles.app}>
+      <aside style={styles.sidebar}>
+        <div style={styles.brand}><span style={styles.brandMark}>◆</span> Bitácora</div>
+        <div style={styles.offlineTag}>Versión local — sin sync de Calendar</div>
+
+        <nav style={{ marginTop: 16 }}>
+          {[["hoy", "Hoy"], ["proximos", "Próximos"], ["todo", "Todo"], ["categoria", "Por categoría"], ["kpi", "KPI"]].map(([key, label]) => (
+            <button key={key} onClick={() => setView(key)} style={{ ...styles.navBtn, ...(view === key ? styles.navBtnActive : {}) }}>{label}</button>
+          ))}
+        </nav>
+
+        <div style={styles.sideDivider} />
+        <div style={styles.sideLabel}>Categorías</div>
+        <button className="pld-cat-btn" onClick={() => setActiveCategory(null)} style={{ ...styles.catRow, ...(activeCategory === null ? styles.catRowActive : {}) }}>
+          <Ic size={13} style={{ opacity: 0.6 }}>▤</Ic><span style={{ flex: 1, textAlign: "left" }}>Todas</span><span style={styles.countPill}>{tasks.length}</span>
+        </button>
+
+        {categories.map((c) => editingCategory === c.id ? (
+          <NewCategoryForm key={c.id} initialName={c.name} initialColor={c.color} saveLabel="Guardar" onCancel={() => setEditingCategory(null)} onSave={(name, color) => updateCategory(c.id, name, color)} />
+        ) : (
+          <button key={c.id} className="pld-cat-btn" onClick={() => setActiveCategory(c.id)} style={{ ...styles.catRow, ...(activeCategory === c.id ? styles.catRowActive : {}) }}>
+            <span style={{ width: 8, height: 8, borderRadius: 2, background: c.color, flexShrink: 0 }} />
+            <span style={{ flex: 1, textAlign: "left", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c.name}</span>
+            <span style={styles.countPill}>{taskCounts[c.id] || 0}</span>
+            <span onClick={(e) => { e.stopPropagation(); setEditingCategory(c.id); }} style={styles.rowDelete} title="Editar categoría"><Ic size={12}>✎</Ic></span>
+            {confirmingCatDelete === c.id ? (
+              <span onClick={(e) => { e.stopPropagation(); deleteCategory(c.id); }} style={styles.confirmChip}>confirmar</span>
+            ) : (
+              <span onClick={(e) => { e.stopPropagation(); setConfirmingCatDelete(c.id); setTimeout(() => setConfirmingCatDelete((v) => (v === c.id ? null : v)), 2500); }} style={styles.rowDelete} title="Eliminar categoría"><Ic size={12}>🗑</Ic></span>
+            )}
+          </button>
+        ))}
+
+        {showCatForm ? (
+          <NewCategoryForm onCancel={() => setShowCatForm(false)} onSave={(name, color) => { addCategory(name, color); setShowCatForm(false); }} />
+        ) : (
+          <button style={styles.addCatBtn} onClick={() => setShowCatForm(true)}><Ic size={13}>+</Ic> Nueva categoría</button>
+        )}
+      </aside>
+
+      <main style={styles.main}>
+        <header style={styles.header}>
+          <div>
+            <h1 style={styles.title}>{view === "hoy" ? "Hoy" : view === "proximos" ? "Próximos" : view === "categoria" ? "Por categoría" : view === "kpi" ? "Panel KPI" : "Todo"}</h1>
+            <p style={styles.subtitle}>{fmtLong(today)}</p>
+          </div>
+          {view !== "kpi" && <button style={styles.newBtn} onClick={() => setShowForm((v) => !v)}><Ic size={15}>+</Ic> Nueva tarea</button>}
+        </header>
+
+        {showForm && view !== "kpi" && (
+          <NewTaskForm categories={categories} onCancel={() => setShowForm(false)} onSave={(data) => { addTask(data); setShowForm(false); }} />
+        )}
+
+        <div className="pld-scroll" style={styles.list}>
+          {view === "kpi" ? (
+            <KpiPanel data={kpiData} scope={kpiScope} setScope={setKpiScope} />
+          ) : (
+            <>
+              {(view === "categoria" ? categoryGroups.length === 0 : groups.length === 0) && (
+                <div style={styles.empty}>
+                  <Ic size={26} style={{ opacity: 0.4, marginBottom: 10 }}>🗓</Ic>
+                  <p style={{ margin: 0, fontWeight: 500, color: "#2C1B45" }}>{view === "hoy" ? "Nada pendiente para hoy" : "No hay tareas acá"}</p>
+                  <p style={{ margin: "4px 0 0", fontSize: 13, color: "#8A8A93" }}>Sumá una tarea para empezar a ordenar el flujo.</p>
+                </div>
+              )}
+              {view !== "categoria" && groups.map((g) => (
+                <div key={g.date} style={{ marginBottom: 18 }}>
+                  <div style={styles.groupLabel}>{g.label}</div>
+                  {g.rows.map((it) => (
+                    <TaskRow key={it.key} it={it} cat={catById[it.task.categoryId]} expanded={expanded} setExpanded={setExpanded}
+                      setStatus={setStatus} toggleSubtask={toggleSubtask} toggleCTA={toggleCTA} deleteTask={deleteTask}
+                      confirmingDelete={confirmingDelete} setConfirmingDelete={setConfirmingDelete} showDate={false} today={today} />
+                  ))}
+                </div>
+              ))}
+              {view === "categoria" && categoryGroups.map((cg) => (
+                <div key={cg.category.id} style={{ marginBottom: 18 }}>
+                  <div style={{ ...styles.groupLabel, display: "flex", alignItems: "center", gap: 6 }}>
+                    <span style={{ width: 8, height: 8, borderRadius: 2, background: cg.category.color }} />{cg.category.name}
+                  </div>
+                  {cg.rows.map((it) => (
+                    <TaskRow key={it.key} it={it} cat={cg.category} expanded={expanded} setExpanded={setExpanded}
+                      setStatus={setStatus} toggleSubtask={toggleSubtask} toggleCTA={toggleCTA} deleteTask={deleteTask}
+                      confirmingDelete={confirmingDelete} setConfirmingDelete={setConfirmingDelete} showDate today={today} />
+                  ))}
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+function TaskRow({ it, cat, expanded, setExpanded, setStatus, toggleSubtask, toggleCTA, deleteTask, confirmingDelete, setConfirmingDelete, showDate, today }) {
+  const recLabel = RECURRENCE_LABEL(it.task.recurrence);
+  const done = it.status === "done", cancelled = it.status === "cancelled";
+  const subtasks = it.task.subtasks || [];
+  const subDone = subtasks.filter((s) => s.done).length;
+  const allSubDone = subtasks.length > 0 ? subDone === subtasks.length : true;
+  const isOpen = !!expanded[it.key];
+  const hasExtras = subtasks.length > 0 || it.task.cta;
+  const urg = URGENCY[it.task.urgency];
+  const promisedLate = it.task.promisedDate && it.task.promisedDate < today && !done;
+
+  return (
+    <div style={styles.rowWrap}>
+      <div className="pld-row" style={{ ...styles.row, borderLeftColor: cat ? cat.color : "#E3E1E6" }}>
+        <button onClick={() => setStatus(it.key, "done")} title={done ? "Marcar como pendiente" : "Marcar como hecha"} style={{ ...styles.checkBtn, ...(done ? styles.checkBtnDone : {}) }}>
+          {done ? <Ic size={12}>✓</Ic> : <Ic size={12}>○</Ic>}
+        </button>
+        <div style={{ flex: 1, minWidth: 0 }} onClick={() => hasExtras && setExpanded((e) => ({ ...e, [it.key]: !e[it.key] }))}>
+          <div style={{ fontSize: 14, fontWeight: 500, color: done || cancelled ? "#B3AFC0" : "#2C1B45", textDecoration: done || cancelled ? "line-through" : "none", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", cursor: hasExtras ? "pointer" : "default", display: "flex", alignItems: "center", gap: 6 }}>
+            {hasExtras && <Ic size={12} style={{ opacity: 0.5 }}>{isOpen ? "▾" : "▸"}</Ic>}
+            {urg && <span title={`Urgencia ${urg.label}`} style={{ width: 7, height: 7, borderRadius: "50%", background: urg.color, flexShrink: 0 }} />}
+            {it.task.title}
+          </div>
+          <div style={styles.metaRow}>
+            {cat && !showDate && <span style={{ color: cat.color }}>{cat.name}</span>}
+            {showDate && <span>{dateLabel(it.date, today)}</span>}
+            {urg && <span style={{ color: urg.color, fontWeight: 500 }}>{urg.label}</span>}
+            {recLabel && <span style={styles.recBadge}><Ic size={11}>↻</Ic> {recLabel}</span>}
+            {subtasks.length > 0 && <span style={styles.subPill}>{subDone}/{subtasks.length} subtareas</span>}
+            {it.task.promisedDate && (
+              <span style={{ display: "flex", alignItems: "center", gap: 3, color: promisedLate ? "#C1442D" : "#8A8A93", fontWeight: promisedLate ? 500 : 400 }}>
+                <Ic size={11}>{promisedLate ? "⚠" : "🕐"}</Ic> prometida {fmtShort(it.task.promisedDate)}
+              </span>
+            )}
+            {cancelled && <span style={styles.cancelledTag}>cancelada</span>}
+          </div>
+        </div>
+        <button onClick={() => setStatus(it.key, "cancelled")} title={cancelled ? "Reabrir esta instancia" : "Cancelar solo esta instancia"} style={{ ...styles.iconBtn, ...(cancelled ? styles.iconBtnCancelled : {}) }}><Ic size={12}>✕</Ic></button>
+        {confirmingDelete === it.task.id ? (
+          <button onClick={() => deleteTask(it.task)} style={styles.confirmDeleteBtn}>confirmar</button>
+        ) : (
+          <button onClick={() => { setConfirmingDelete(it.task.id); setTimeout(() => setConfirmingDelete((v) => (v === it.task.id ? null : v)), 2500); }} title="Eliminar tarea (todas las instancias)" style={styles.iconBtn}><Ic size={12}>🗑</Ic></button>
+        )}
+      </div>
+
+      {isOpen && hasExtras && (
+        <div style={styles.expandPanel}>
+          <div style={{ fontSize: 11, color: "#8A8A93", marginBottom: 6 }}>Creada el {fmtDateTime(it.task.createdAt)}</div>
+          {subtasks.map((s) => {
+            const subLate = s.dueDate && s.dueDate < today && !s.done;
+            return (
+              <div key={s.id} style={styles.subRow}>
+                <button onClick={() => toggleSubtask(it.task.id, s.id)} style={{ ...styles.subCheck, ...(s.done ? styles.subCheckDone : {}) }}>{s.done ? <Ic size={9}>✓</Ic> : null}</button>
+                <span style={{ flex: 1, fontSize: 13, color: s.done ? "#B3AFC0" : "#3A2E4E", textDecoration: s.done ? "line-through" : "none" }}>{s.title}</span>
+                {s.dueDate && <span style={{ display: "flex", alignItems: "center", gap: 3, fontSize: 11, color: subLate ? "#C1442D" : "#8A8A93", fontWeight: subLate ? 500 : 400, flexShrink: 0 }}><Ic size={10}>{subLate ? "⚠" : "🕐"}</Ic> {fmtShort(s.dueDate)}</span>}
+                {s.driveUrl && <a href={s.driveUrl} target="_blank" rel="noopener noreferrer" style={styles.driveLink} title="Abrir en Google Drive"><Ic size={11}>🔗</Ic> Drive <Ic size={10}>↗</Ic></a>}
+              </div>
+            );
+          })}
+          {it.task.cta && (
+            <button onClick={() => toggleCTA(it.task.id)} style={{ ...styles.ctaBtn, ...(it.task.cta.done ? styles.ctaBtnDone : allSubDone ? styles.ctaBtnReady : {}) }}>
+              <Ic size={13}>📞</Ic> {it.task.cta.done ? `${it.task.cta.label} · hecho` : it.task.cta.label}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function KpiPanel({ data, scope, setScope }) {
+  const totals = data.reduce((acc, d) => { acc.total += d.total; acc.done += d.done; acc.pending += d.pending; acc.cancelled += d.cancelled; acc.overdue += d.overdue; return acc; }, { total: 0, done: 0, pending: 0, cancelled: 0, overdue: 0 });
+  return (
+    <div>
+      <div style={styles.kpiScopeRow}>
+        {[["todo", "Todo el historial"], ["mes", "Este mes"]].map(([key, label]) => (
+          <button key={key} onClick={() => setScope(key)} style={{ ...styles.kpiScopeBtn, ...(scope === key ? styles.kpiScopeBtnActive : {}) }}>{label}</button>
+        ))}
+      </div>
+      {data.length === 0 ? (
+        <div style={styles.empty}><Ic size={26} style={{ opacity: 0.4, marginBottom: 10 }}>📊</Ic><p style={{ margin: 0, fontWeight: 500, color: "#2C1B45" }}>Todavía no hay datos para este período</p></div>
+      ) : (
+        <>
+          <div style={styles.kpiSummaryRow}>
+            <KpiStat label="Total" value={totals.total} color="#2C1B45" />
+            <KpiStat label="Cumplidas" value={totals.done} color="#5A7A55" />
+            <KpiStat label="Pendientes" value={totals.pending} color="#C98A2A" />
+            <KpiStat label="Vencidas" value={totals.overdue} color="#C1442D" />
+            <KpiStat label="Canceladas" value={totals.cancelled} color="#8A8A93" />
+          </div>
+          <div style={{ marginTop: 6 }}>
+            {data.map((d) => {
+              const pct = d.total > 0 ? Math.round((d.done / d.total) * 100) : 0;
+              return (
+                <div key={d.category.id} style={styles.kpiCatCard}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                    <span style={{ width: 9, height: 9, borderRadius: 2, background: d.category.color, flexShrink: 0 }} />
+                    <span style={{ fontWeight: 600, fontSize: 14, flex: 1 }}>{d.category.name}</span>
+                    <span style={{ fontSize: 12, color: "#8A8A93" }}>{pct}% cumplido</span>
+                  </div>
+                  <div style={styles.kpiBarTrack}><div style={{ ...styles.kpiBarFill, width: `${pct}%` }} /></div>
+                  <div style={styles.kpiCatStats}>
+                    <span>{d.total} en total</span>
+                    <span style={{ color: "#5A7A55" }}>{d.done} cumplidas</span>
+                    <span style={{ color: "#C98A2A" }}>{d.pending} pendientes</span>
+                    <span style={{ color: "#C1442D" }}>{d.overdue} vencidas</span>
+                    <span style={{ color: "#8A8A93" }}>{d.cancelled} canceladas</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+function KpiStat({ label, value, color }) {
+  return <div style={styles.kpiStat}><div style={{ fontSize: 22, fontWeight: 600, color, fontFamily: "'Space Grotesk', sans-serif" }}>{value}</div><div style={{ fontSize: 11, color: "#8A8A93", textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</div></div>;
+}
+
+function NewCategoryForm({ onSave, onCancel, initialName = "", initialColor = CATEGORY_COLORS[0].hex, saveLabel = "Crear" }) {
+  const [name, setName] = useState(initialName);
+  const [color, setColor] = useState(initialColor);
+  return (
+    <div style={styles.catForm}>
+      <input autoFocus placeholder="Nombre" value={name} onChange={(e) => setName(e.target.value)} style={styles.catInput} />
+      <div style={{ display: "flex", gap: 6, margin: "8px 0" }}>
+        {CATEGORY_COLORS.map((c) => (
+          <button key={c.hex} onClick={() => setColor(c.hex)} style={{ width: 16, height: 16, borderRadius: 4, background: c.hex, border: color === c.hex ? "2px solid #2C1B45" : "1px solid transparent", cursor: "pointer", padding: 0 }} />
+        ))}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <button style={styles.formSaveSmall} onClick={() => { if (name.trim()) onSave(name.trim(), color); }}>{saveLabel}</button>
+        <button style={styles.formCancelSmall} onClick={onCancel}>Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+function NewTaskForm({ categories, onCancel, onSave }) {
+  const [title, setTitle] = useState("");
+  const [categoryId, setCategoryId] = useState(categories[0]?.id || "");
+  const [startDate, setStartDate] = useState(todayISO());
+  const [recType, setRecType] = useState("none");
+  const [interval, setIntervalV] = useState(1);
+  const [notes, setNotes] = useState("");
+  const [error, setError] = useState("");
+  const [subtasks, setSubtasks] = useState([]);
+  const [useCTA, setUseCTA] = useState(false);
+  const [ctaLabel, setCtaLabel] = useState("Contactar cliente");
+  const [urgency, setUrgency] = useState("media");
+  const [promisedDate, setPromisedDate] = useState("");
+
+  useEffect(() => { if (!categoryId && categories.length) setCategoryId(categories[0].id); }, [categories]); // eslint-disable-line
+
+  const addSubtaskRow = () => setSubtasks((s) => [...s, { id: uid("s"), title: "", driveUrl: "", dueDate: "" }]);
+  const updateSubtask = (id, patch) => setSubtasks((s) => s.map((x) => (x.id === id ? { ...x, ...patch } : x)));
+  const removeSubtask = (id) => setSubtasks((s) => s.filter((x) => x.id !== id));
+
+  const handleSave = () => {
+    if (!title.trim()) { setError("Poné un título para la tarea."); return; }
+    if (!categoryId) { setError("Elegí una categoría, o creá una nueva desde la barra lateral."); return; }
+    const cleanSubtasks = subtasks.filter((s) => s.title.trim()).map((s) => ({ id: s.id, title: s.title.trim(), driveUrl: s.driveUrl.trim(), dueDate: s.dueDate || null, done: false }));
+    onSave({
+      title: title.trim(), notes: notes.trim(), categoryId, startDate,
+      recurrence: recType === "none" ? { type: "none" } : { type: recType, interval: Math.max(1, Number(interval) || 1) },
+      subtasks: cleanSubtasks,
+      cta: useCTA ? { label: (ctaLabel.trim() || "Contactar cliente"), done: false } : null,
+      urgency, promisedDate: promisedDate || null,
+    });
+  };
+
+  return (
+    <div style={styles.formPanel}>
+      <input autoFocus placeholder="Título de la tarea" value={title} onChange={(e) => { setTitle(e.target.value); if (error) setError(""); }} style={styles.formTitleInput} />
+      <div style={styles.formGrid}>
+        <label style={styles.formField}>
+          <span style={styles.formLabel}>Categoría</span>
+          {categories.length === 0 ? (
+            <div style={styles.noCategoryHint}>Todavía no creaste ninguna. Usá "+ Nueva categoría" en la barra lateral.</div>
+          ) : (
+            <select value={categoryId} onChange={(e) => setCategoryId(e.target.value)} style={styles.formSelect}>
+              <option value="" disabled>Elegí una categoría</option>
+              {categories.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}
+            </select>
+          )}
+        </label>
+        <label style={styles.formField}><span style={styles.formLabel}>Fecha</span><input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} style={styles.formSelect} /></label>
+        <label style={styles.formField}>
+          <span style={styles.formLabel}>Repetición</span>
+          <select value={recType} onChange={(e) => setRecType(e.target.value)} style={styles.formSelect}>
+            <option value="none">Ninguna</option><option value="daily">Diaria</option><option value="weekly">Semanal</option><option value="monthly">Mensual</option>
+          </select>
+        </label>
+        {recType !== "none" && (<label style={styles.formField}><span style={styles.formLabel}>Cada</span><input type="number" min={1} value={interval} onChange={(e) => setIntervalV(e.target.value)} style={styles.formSelect} /></label>)}
+        <label style={styles.formField}>
+          <span style={styles.formLabel}>Urgencia</span>
+          <select value={urgency} onChange={(e) => setUrgency(e.target.value)} style={styles.formSelect}><option value="alta">Alta</option><option value="media">Media</option><option value="baja">Baja</option></select>
+        </label>
+        <label style={styles.formField}><span style={styles.formLabel}>Fecha prometida</span><input type="date" value={promisedDate} onChange={(e) => setPromisedDate(e.target.value)} style={styles.formSelect} /></label>
+      </div>
+      <textarea placeholder="Notas (opcional)" value={notes} onChange={(e) => setNotes(e.target.value)} style={styles.formTextarea} />
+      <div style={styles.subEditor}>
+        <div style={styles.formLabel}>Subtareas</div>
+        {subtasks.map((s) => (
+          <div key={s.id} style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+            <input placeholder="ej. Video 1" value={s.title} onChange={(e) => updateSubtask(s.id, { title: e.target.value })} style={{ ...styles.formSelect, flex: 2, minWidth: 100 }} />
+            <input type="date" value={s.dueDate} onChange={(e) => updateSubtask(s.id, { dueDate: e.target.value })} style={{ ...styles.formSelect, flex: 1, minWidth: 100 }} title="Fecha de vencimiento" />
+            <input placeholder="Link de Drive (opcional)" value={s.driveUrl} onChange={(e) => updateSubtask(s.id, { driveUrl: e.target.value })} style={{ ...styles.formSelect, flex: 2, minWidth: 120 }} />
+            <button onClick={() => removeSubtask(s.id)} style={styles.iconBtn}><Ic size={12}>✕</Ic></button>
+          </div>
+        ))}
+        <button onClick={addSubtaskRow} style={styles.addSubBtn}><Ic size={11}>+</Ic> Agregar subtarea</button>
+      </div>
+      <label style={styles.checkboxRow}><input type="checkbox" checked={useCTA} onChange={(e) => setUseCTA(e.target.checked)} /> Agregar acción final (ej. "Contactar cliente")</label>
+      {useCTA && (<input value={ctaLabel} onChange={(e) => setCtaLabel(e.target.value)} style={{ ...styles.formSelect, marginBottom: 10, width: "100%" }} />)}
+      {error && <div style={styles.formError}>{error}</div>}
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <button style={styles.formSave} onClick={handleSave}>Guardar tarea</button>
+        <button style={styles.formCancel} onClick={onCancel}>Cancelar</button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- styles ----------
+const INK = "#2C1B45", PAPER = "#F4F3F0", PAPER_2 = "#ECEBE6", LINE = "#E3E1E6", MUTED = "#8A8A93", ACCENT = "#8B4F82";
+const styles = {
+  loadingWrap: { display: "flex", alignItems: "center", justifyContent: "center", padding: "60px 0", color: MUTED },
+  app: { display: "flex", background: PAPER, color: INK, minHeight: 640, borderRadius: 14, overflow: "hidden", border: `1px solid ${LINE}`, boxShadow: "0 8px 30px rgba(44,27,69,0.12)" },
+  sidebar: { width: 210, flexShrink: 0, background: PAPER_2, borderRight: `1px solid ${LINE}`, padding: "18px 14px", display: "flex", flexDirection: "column" },
+  brand: { fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600, fontSize: 16, display: "flex", alignItems: "center", gap: 8 },
+  brandMark: { color: ACCENT, fontSize: 12 },
+  offlineTag: { fontSize: 10.5, color: MUTED, marginTop: 4, fontStyle: "italic" },
+  navBtn: { display: "block", width: "100%", textAlign: "left", padding: "7px 10px", marginBottom: 2, fontSize: 13.5, fontWeight: 500, color: "#5C5566", background: "transparent", border: "none", borderRadius: 7, cursor: "pointer" },
+  navBtnActive: { background: "#E7DDE5", color: "#5A2E52" },
+  sideDivider: { height: 1, background: LINE, margin: "16px 0 10px" },
+  sideLabel: { fontSize: 11, textTransform: "uppercase", letterSpacing: "0.06em", color: MUTED, padding: "0 10px", marginBottom: 4 },
+  catRow: { display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 10px", marginBottom: 1, background: "transparent", border: "none", borderRadius: 7, fontSize: 13, color: "#4C475A", cursor: "pointer" },
+  catRowActive: { background: "#E7DDE5" },
+  countPill: { fontSize: 11, color: MUTED },
+  rowDelete: { display: "flex", opacity: 0.35, padding: 2, cursor: "pointer" },
+  confirmChip: { fontSize: 10.5, color: "#B0503A", fontWeight: 500, whiteSpace: "nowrap", cursor: "pointer" },
+  addCatBtn: { marginTop: "auto", display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: MUTED, background: "transparent", border: `1px dashed ${LINE}`, borderRadius: 7, padding: "7px 10px", cursor: "pointer" },
+  catForm: { marginTop: "auto", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 8, padding: 10 },
+  catInput: { width: "100%", fontSize: 13, padding: "6px 8px", border: `1px solid ${LINE}`, borderRadius: 6, background: "#fff", outline: "none" },
+  formSaveSmall: { fontSize: 12, background: ACCENT, color: "#fff", border: "none", borderRadius: 6, padding: "5px 10px", cursor: "pointer" },
+  formCancelSmall: { fontSize: 12, background: "transparent", color: MUTED, border: "none", cursor: "pointer" },
+  main: { flex: 1, display: "flex", flexDirection: "column", minWidth: 0 },
+  header: { display: "flex", alignItems: "flex-end", justifyContent: "space-between", padding: "20px 24px 14px" },
+  title: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 21, fontWeight: 600, margin: 0 },
+  subtitle: { margin: "3px 0 0", fontSize: 12.5, color: MUTED },
+  newBtn: { display: "flex", alignItems: "center", gap: 6, background: INK, color: "#F4F3F0", border: "none", borderRadius: 8, padding: "8px 13px", fontSize: 13, fontWeight: 500, cursor: "pointer" },
+  formPanel: { margin: "0 24px 14px", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 14 },
+  formTitleInput: { width: "100%", fontSize: 14.5, fontWeight: 500, padding: "8px 4px", border: "none", borderBottom: `1px solid ${LINE}`, outline: "none", marginBottom: 10 },
+  formGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(120px, 1fr))", gap: 10, marginBottom: 10 },
+  formField: { display: "flex", flexDirection: "column", gap: 4 },
+  formLabel: { fontSize: 11, color: MUTED, textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 4 },
+  formSelect: { fontSize: 13, padding: "6px 8px", border: `1px solid ${LINE}`, borderRadius: 6, background: PAPER, outline: "none" },
+  noCategoryHint: { fontSize: 12, color: "#B0503A", background: "#FBEFEC", border: "1px dashed #E0B3A6", borderRadius: 6, padding: "6px 8px" },
+  formTextarea: { width: "100%", fontSize: 13, padding: "7px 8px", border: `1px solid ${LINE}`, borderRadius: 6, resize: "vertical", minHeight: 42, outline: "none", marginBottom: 12 },
+  subEditor: { border: `1px solid ${LINE}`, borderRadius: 8, padding: 10, marginBottom: 10, background: PAPER },
+  addSubBtn: { display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: ACCENT, background: "transparent", border: `1px dashed ${LINE}`, borderRadius: 6, padding: "5px 9px", cursor: "pointer" },
+  checkboxRow: { display: "flex", alignItems: "center", gap: 7, fontSize: 12.5, color: "#4C475A", marginBottom: 8, cursor: "pointer" },
+  formError: { fontSize: 12, color: "#B0503A", marginBottom: 6 },
+  formSave: { background: ACCENT, color: "#fff", border: "none", borderRadius: 7, padding: "7px 14px", fontSize: 13, fontWeight: 500, cursor: "pointer" },
+  formCancel: { background: "transparent", color: MUTED, border: "none", fontSize: 13, cursor: "pointer" },
+  list: { flex: 1, overflowY: "auto", padding: "0 24px 24px" },
+  groupLabel: { fontSize: 11.5, fontWeight: 500, color: MUTED, textTransform: "uppercase", letterSpacing: "0.05em", margin: "10px 0 6px" },
+  rowWrap: { marginBottom: 3 },
+  row: { display: "flex", alignItems: "center", gap: 10, padding: "9px 10px 9px 12px", borderLeft: "3px solid", borderBottom: `1px solid ${LINE}`, background: "#fff", borderTopRightRadius: 6, borderBottomRightRadius: 6 },
+  checkBtn: { width: 22, height: 22, borderRadius: "50%", border: `1.4px solid #D7D3DC`, background: "transparent", display: "flex", alignItems: "center", justifyContent: "center", color: MUTED, cursor: "pointer", flexShrink: 0 },
+  checkBtnDone: { background: ACCENT, borderColor: ACCENT, color: "#fff" },
+  metaRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 11.5, color: MUTED, marginTop: 2, flexWrap: "wrap" },
+  recBadge: { display: "flex", alignItems: "center", gap: 3 },
+  subPill: { background: PAPER_2, borderRadius: 4, padding: "1px 6px" },
+  cancelledTag: { color: "#B0503A", fontWeight: 500 },
+  iconBtn: { width: 24, height: 24, display: "flex", alignItems: "center", justifyContent: "center", border: "none", background: "transparent", color: "#C6C2CC", borderRadius: 6, cursor: "pointer", flexShrink: 0 },
+  iconBtnCancelled: { color: "#B0503A" },
+  confirmDeleteBtn: { fontSize: 11, color: "#fff", background: "#B0503A", border: "none", borderRadius: 6, padding: "4px 8px", cursor: "pointer", flexShrink: 0 },
+  empty: { textAlign: "center", padding: "50px 0", color: MUTED },
+  expandPanel: { background: "#FBFAF8", border: `1px solid ${LINE}`, borderTop: "none", borderBottomLeftRadius: 6, borderBottomRightRadius: 6, padding: "8px 14px 10px 40px" },
+  subRow: { display: "flex", alignItems: "center", gap: 8, padding: "4px 0", flexWrap: "wrap" },
+  subCheck: { width: 16, height: 16, borderRadius: 4, border: "1.4px solid #D7D3DC", background: "#fff", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", cursor: "pointer", flexShrink: 0 },
+  subCheckDone: { background: ACCENT, borderColor: ACCENT },
+  driveLink: { display: "flex", alignItems: "center", gap: 3, fontSize: 11.5, color: "#33566B", textDecoration: "none", flexShrink: 0 },
+  ctaBtn: { display: "flex", alignItems: "center", gap: 7, marginTop: 8, fontSize: 12.5, fontWeight: 500, padding: "6px 12px", borderRadius: 7, border: `1px solid ${LINE}`, background: "#fff", color: "#5C5566", cursor: "pointer" },
+  ctaBtnReady: { background: ACCENT, color: "#fff", border: `1px solid ${ACCENT}` },
+  ctaBtnDone: { background: "#EFEAEE", color: "#8B4F82", border: `1px solid ${LINE}` },
+  kpiScopeRow: { display: "flex", gap: 6, marginBottom: 16 },
+  kpiScopeBtn: { fontSize: 12.5, fontWeight: 500, color: "#5C5566", background: "#fff", border: `1px solid ${LINE}`, borderRadius: 7, padding: "6px 12px", cursor: "pointer" },
+  kpiScopeBtnActive: { background: INK, color: "#F4F3F0", borderColor: INK },
+  kpiSummaryRow: { display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(90px, 1fr))", gap: 10, marginBottom: 20 },
+  kpiStat: { background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: "12px 10px", textAlign: "center" },
+  kpiCatCard: { background: "#fff", border: `1px solid ${LINE}`, borderRadius: 10, padding: 14, marginBottom: 10 },
+  kpiBarTrack: { height: 6, borderRadius: 4, background: PAPER_2, overflow: "hidden", marginBottom: 8 },
+  kpiBarFill: { height: "100%", background: ACCENT, borderRadius: 4 },
+  kpiCatStats: { display: "flex", gap: 14, fontSize: 12, color: "#4C475A", flexWrap: "wrap" },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Plandia />);
+</script>
+</body>
+</html>
